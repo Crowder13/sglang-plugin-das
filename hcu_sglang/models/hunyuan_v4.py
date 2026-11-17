@@ -58,6 +58,9 @@ def replacement_load_weights(original_fn, self, weights):
     if getattr(quant_config, "checkpoint_format", None) != _HY4_CT_W4A8_FORMAT:
         return original_fn(self, weights)
 
+    if quant_config.uses_hyv4_deepep():
+        return original_fn(self, weights)
+
     def mapped_weights():
         for name, loaded_weight in weights:
             name, loaded_weight = adapt_hyv4_packed_weight(
