@@ -3964,3 +3964,47 @@ NEXTN steps=4 adaptive、decode graph 批次 1..40、`--disable-radix-cache`。
 
 - 未在真实 HCU 设备上运行模型；fp8 descale tile 与 lightop 回退缺少实机/整模型验证。
 - 未运行 GitHub CI。
+
+## 2026-11-17 HYV4 interleave prefill CP8
+
+目标为官方 `baa9bef` + adapter `253989d` + plugin `3fab2fd`，沿用
+`launch_hy4_sqw4.sh` 的 TP8/CP8/EP8、dense TP1、DeepEP、slimquant W4A8。
+行为参考 `JaneEyreliu/sglang-das:feat/hy4_dcp_adapt` 的 `49a3350`；
+目标框架由 eager runner 负责 CP metadata、输入分片和 logits 前聚合。
+
+- HYV4 hook 为 runner 提供完整 embedding 与 positions；iHC 留在 rank 本地的
+  forward body，dense FFN 使用完整权重，避免对不同 token 的 TP 部分和做归约。
+- HCU 且精确匹配目标拓扑时，以进程内的私有函数绑定接入官方 model resolution；
+  保留其他 provider、非 CP HYV4 及上游 DCP 检查。decode 复用现有
+  `current_dsa` 的 native FlashMLA sink 路径；该组合中 auto KV 解析为 FP8 E4M3。
+  不修改 adapter 或官方源码，不从 DAS fork 动态加载实现。
+- 在目标容器复现旧版 model resolution 拒绝；改后原脚本 argv 通过完整 resolution，
+  并确认当前 DSA backend 的 provider 来自 plugin。会话期间全部 8 张 HCU 显存均
+  高占用，整机 load、decode graph、prefill 和生成验证待空卡执行。
+
+S3 空卡重试时，native Ninja 在 5 秒内完成 fused RoPE 编译。Decode graph
+随后暴露 HYV4 CT SlimQuant 专家误走官方 DeepEP 已退役接口的问题。
+HYV4 CT packed 专家在 HCU DeepEP 下复用 `HCUW4A8Int8DeepEPMoEMethod`，
+由该方法直接处理原始 checkpoint packing，普通 TP 路径保留既有 Marlin 加载。
+S3 验证进程显式开启 contiguous/masked HIPC，沿用原脚本的 CP8/EP8 拓扑。
+
+组合环境需在验证进程设置 `HCU_DEEPEP_BRIDGE=0`。plugin 的 dispatcher 直接
+使用 vendor DeepEP 的 `quant_type` ABI。adapter 的 v0.5.21 兼容 wrapper
+会隐藏该参数，使 low-latency 分支无法选择 INT8。
+
+S3 的 DTK DeepEP wheel 清理 low-latency buffer 时不接受 `num_topk`。
+`DeepEPBuffer.clean_buffer()` 按实际签名传参，保留 normal→low-latency 的清理。
+2026-11-17 的 `S3-eval-20261117-171635` 验证中，八卡 decode graph
+capture 和在线 replay 通过，对话 3/3。GSM8K 前 200 题、并发 16、0-shot
+no_think 为 167/200（83.5%），耗时 1858 秒。13 题达到 4096 token
+上限，均判错。该轮配置未启用 plugin 的策略化 CP。整批 prefill token
+数可以被 CP8 整除时，旧 HCU 路径分片了 DSA 元数据，HYV4 model body
+仍收到全量输入，多个不同 prompt 会产生相同的错误首 token。
+通过校验的 HYV4 prefill CP 配置在 plugin 里开启策略化 CP，统一由 runner
+分片模型输入、执行 DSA 并在 logits 前聚合。原启动参数足以选择这条路径。
+
+S3 的 `S3-cpv2-20261117-180519` 对照进程只开启策略化 CP。19 组首
+token 探针恢复正常，对话 3/3。同一前 200 题、并发 16、0-shot no_think、
+4096 token 上限得到 195/200（97.5%），与历史 TP8 的总正确数相同。
+两轮 CP8 的异常首 token 数为 28→0，达到 token 上限的题数为 13→0。
+清空外部 CP 环境变量后，新代码通过原启动参数的解析验证。
