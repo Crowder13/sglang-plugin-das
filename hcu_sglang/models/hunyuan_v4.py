@@ -25,6 +25,12 @@ _HY4_CT_W4A8_FORMAT = "hy4_compressed_tensors_w4a8"
 
 
 def register_hooks() -> None:
+    from hcu_sglang.models import hyv4_env_hooks
+
+    hyv4_env_hooks.register_hooks()
+    from hcu_sglang.models import hyv4_nextn
+
+    hyv4_nextn.register_hooks()
     for target, hook in (
         (_INIT_TARGET, replacement_init),
         (_LOAD_WEIGHTS_TARGET, replacement_load_weights),

@@ -15,6 +15,8 @@ _ARCH = "HYV4ForCausalLM"
 
 
 def _validate_profile(cfg, hf_config):
+    from hcu_sglang.models.hyv4_nextn import supports_mtp_profile
+
     if not (
         cfg.cp_strategy == "interleave"
         and cfg.tp_size == cfg.attn_cp_size == cfg.ep_size == 8
@@ -25,7 +27,7 @@ def _validate_profile(cfg, hf_config):
         and cfg.dsa_decode_backend == "flashmla_kv"
         and cfg.attn_dp_size == cfg.dp_size == cfg.pp_size == cfg.dcp_size == 1
         and cfg.disaggregation_mode == "null"
-        and cfg.speculative_algorithm is None
+        and supports_mtp_profile(cfg)
         and not cfg.enable_mixed_chunk
         and not cfg.enable_dsa_cache_layer_split
         and not cfg.enable_hisparse
@@ -36,7 +38,8 @@ def _validate_profile(cfg, hf_config):
         raise ValueError(
             "HCU HYV4 prefill CP requires interleave CP8/TP8/EP8, "
             "DeepEP, dense TP1, DSA flashmla_sparse prefill and flashmla_kv "
-            "decode, without DP, PP, DCP, PD, speculation or cache sharding."
+            "decode, without DP, PP, DCP, PD or cache sharding; MTP requires "
+            "NEXTN/EAGLE, topk1 and draft_tokens=num_steps+1."
         )
     from hcu_sglang.layers.attention.current_dsa.flashmla_backend import get_flashmla_op
 
