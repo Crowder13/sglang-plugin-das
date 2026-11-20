@@ -3,6 +3,7 @@
 import logging
 
 from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+from sglang.srt.utils import get_bool_env_var
 from hcu_sglang.models.qwen import attention_int8
 from hcu_sglang.models.fused_rotary import (
     fused_rms_rotary_kv_store,
@@ -20,6 +21,17 @@ _GDN_INIT_TARGET = _MODULE + ".Qwen3_5GatedDeltaNet.__init__"
 
 def register() -> None:
     logger.info("[hcu_sglang] register AROUND hook: %s", _GDN_INIT_TARGET)
+    if get_bool_env_var("SGLANG_HCU_QWEN_GDN_RMS_FP8_FUSION"):
+        from hcu_sglang.models.qwen import gdn_fp8
+
+        HookRegistry.register(
+            _MODULE + ".Qwen3_5GatedDeltaNet.forward",
+            gdn_fp8.around_forward,
+            HookType.AROUND,
+        )
+    logger.info("[hcu_sglang] register AROUND hook: %s", _TARGET)
+    HookRegistry.register(_TARGET, replacement_self_attention, HookType.AROUND)
+
     HookRegistry.register(_GDN_INIT_TARGET, around_gdn_init, HookType.AROUND)
     HookRegistry.register(
         _MODULE + ".Qwen3_5AttentionDecoderLayer.forward_prepare_cuda_fused",
