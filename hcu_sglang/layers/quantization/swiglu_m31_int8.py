@@ -9,10 +9,23 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 
-_USE_LIGHTOP_INT8 = (
-    os.getenv("SGLANG_USE_LIGHTOP_OAI_INT8_QUANT", "0") == "1"
-    and importlib.util.find_spec("lightop.activation.swiglu_oai_int8_quant") is not None
-)
+def _lightop_int8_available():
+    # find_spec on a dotted name imports the parent packages: a
+    # missing/broken lightop install raises here instead of probing
+    # clean (bot review P3) -- degrade to the triton arm, never fail
+    # module import over an opt-in accelerator probe.
+    if os.getenv("SGLANG_USE_LIGHTOP_OAI_INT8_QUANT", "0") != "1":
+        return False
+    try:
+        return (
+            importlib.util.find_spec(
+                "lightop.activation.swiglu_oai_int8_quant"
+            ) is not None
+        )
+    except (ImportError, ValueError):
+        return False
+
+_USE_LIGHTOP_INT8 = _lightop_int8_available()
 
 
 @triton.jit
