@@ -33,7 +33,12 @@ def register() -> None:
             HookType.AROUND,
         )
     logger.info("[hcu_sglang] register AROUND hook: %s", _TARGET)
-    HookRegistry.register(_TARGET, replacement_self_attention, HookType.AROUND)
+    attention_hook = replacement_self_attention
+    if get_bool_env_var("SGLANG_HCU_QWEN_ATTN_SIGMOID_FP8_FUSION"):
+        from hcu_sglang.models.qwen import attention_fp8
+
+        attention_hook = attention_fp8.around_self_attention
+    HookRegistry.register(_TARGET, attention_hook, HookType.AROUND)
     HookRegistry.register(_GDN_INIT_TARGET, around_gdn_init, HookType.AROUND)
     HookRegistry.register(
         _MODULE + ".Qwen3_5AttentionDecoderLayer.forward_prepare_cuda_fused",
