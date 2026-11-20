@@ -3,6 +3,7 @@
 import logging
 
 from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+from hcu_sglang.models.qwen import attention_int8
 from hcu_sglang.models.fused_rotary import (
     fused_rms_rotary_kv_store,
     use_fused_rms_rotary,
@@ -34,6 +35,14 @@ def register() -> None:
                 qwen_rms_int8.around_decoder_forward,
                 HookType.AROUND,
             )
+
+
+def replacement_self_attention(original, self, positions, hidden_states, forward_batch):
+    if attention_int8.enabled:
+        return attention_int8.around_self_attention(
+            original, self, positions, hidden_states, forward_batch
+        )
+    return original(self, positions, hidden_states, forward_batch)
 
 
 def around_gdn_init(original, self, *args, **kwargs):
