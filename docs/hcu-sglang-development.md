@@ -4351,6 +4351,35 @@ nmz16 gfx938 两组 TP4 在移除配方环境变量后，均完成 eager Prefill
 KV/index cache 和模型 Hook，并加入显式的 prefill、decode 候选开关。部署所需
 算子入口、模型条件和供应商扩展来源见[配置管理](configuration.md)。
 上游的模型注册及 P/D 调度入口保留，沿用 Scheduler 注册时安装的兼容方法。
+## 2026-11-19 Qwen GDN 输出投影的动态 INT8 融合
+
+`SGLANG_HCU_QWEN_GDN_RMS_INT8_FUSION=1` 启用 Qwen GDN recurrence 后、`out_proj`
+前的 gated RMSNorm 和逐 token 对称 INT8 量化。开关默认关闭，仅在 HCU 注册。
+适用输入为 BF16、128 维 value head，输出投影采用 compressed-tensors 动态对称
+W8A8 且输入已按 TP 切分。投影直接消费 INT8 激活与 FP32 scale，沿用现有 GEMM
+与 TP reduction。Sequence parallel、编译及其他不满足融合条件的路径使用原有实现。
+
+优先使用 LightOp 的 `gated_rms_norm_per_token_int8_quant`。当前依赖版本缺少该 API
+时，通过 plugin 内对应的 Triton kernel 兼容。此项和输入层的
+`SGLANG_HCU_QWEN_RMS_INT8_FUSION` 独立。
+
+bw46 使用 Qwen3.8-27B Channel INT8、TP2、MTP NEXTN 3/1/4 和完整 decode Graph
+（BS1）。两组使用 EvalScope 1.15.0、greedy、seed 42、关闭 thinking，单题上限
+4096 个输出 token。基线在 HCU 0/1，融合组在 HCU 6/7，均沿用现有 LightOp wheel。
+两 rank 在 prefill 和 target-verify Graph 捕获期均记录到融合分发。
+
+| 数据集 | 关闭融合 | 开启融合 |
+| --- | ---: | ---: |
+| HumanEval pass@1 | 160/164（97.56%） | 161/164（98.17%） |
+| MATH-500 accuracy | 470/500（94.00%） | 470/500（94.00%） |
+
+HumanEval 有 1 题仅基线通过、2 题仅融合通过。MATH-500 两组各有 10 题仅本组正确，
+分别有 30 题和 26 题达到输出 token 上限。精度结果覆盖本轮配置和评分口径。
+
+将此变更同步到 0.5.22 发布分支后，以同一 SGLang 版本和模型参数启动融合副本。
+健康检查、真实接口生成和两 rank 的融合分发通过。64 token 请求执行 16 轮 MTP
+verify。新版 GDN 三项单测、原有 RMSNorm INT8 三项单测和 L0 检查通过。
+
 
 已有隔离环境记录覆盖 CP8 的 12K/MTP 调用对照和普通 eager decode。
 本分支只做本地结构与 lint 检查。DCP4、HiSparse 和完整 Graph 组合需要按
