@@ -144,7 +144,7 @@ class QwenAttentionFp8Tests(TestCase):
                 self.layer._prepare_qkv_gate = Mock(return_value=(self.x, self.x, self.x, gate))
                 self.layer.attn.reset_mock()
                 kernel = Mock(return_value=(self.q, self.scale))
-                gemm = Mock(side_effect=lambda _a, _b, result: result.fill_(2))
+                gemm = Mock(side_effect=lambda _q, _x, _w, _s, result: result.fill_(2))
                 collective = Mock(side_effect=lambda x: x + 1)
                 ctx = SimpleNamespace(tp_group=SimpleNamespace(all_reduce=collective))
                 replacements = (
@@ -164,7 +164,7 @@ class QwenAttentionFp8Tests(TestCase):
                     (compressed_fp8.Q, "apply_fp8_linear", fp8_linear.apply_fp8_linear),
                     (compressed_fp8.Q.CompressedTensorsW8A8Fp8, "apply_weights", compressed_fp8.apply_weights),
                     (fp8_linear, "_is_hcu", True),
-                    (fp8_linear.deepgemm, "fp8_gemm", gemm),
+                    (fp8_linear, "fp8_gemm", gemm),
                     (fp8_linear.N, "scaled_fp8_quant", Mock(side_effect=AssertionError("requantization"))),
                 )
                 for obj, name, value in replacements:
@@ -176,8 +176,8 @@ class QwenAttentionFp8Tests(TestCase):
                 self.layer.attn.assert_called_once()
                 kernel.assert_called_once_with(self.x, gate)
                 gemm.assert_called_once()
-                self.assertEqual(gemm.call_args.args[0][0].data_ptr(), self.q.data_ptr())
-                self.assertIs(gemm.call_args.args[0][1], self.scale)
+                self.assertEqual(gemm.call_args.args[0].data_ptr(), self.q.data_ptr())
+                self.assertIs(gemm.call_args.args[1], self.scale)
                 collective.assert_called_once()
                 torch.testing.assert_close(out, torch.full((2, 3), 3, dtype=torch.bfloat16))
 
