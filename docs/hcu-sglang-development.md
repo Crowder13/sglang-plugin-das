@@ -4074,3 +4074,28 @@ EP 规模，插件将其和实际专家并行规模核对。旧权重缺少该�
 CPU 回归覆盖布局生成与复用、EP 规模相同与不匹配、旧权重兼容、
 布局后缀检查、写入失败后的恢复及并发发布。运行时校验在 CPU
 模拟 HIP 上下文中执行，当前未做设备推理或吞吐复测。
+
+## 2026-11-20 minimax-M3.1（m31）整线过闸进 main
+
+分叉背景：m31 底座文件 main 从未有过，release/proj→main 增量挑选组
+（#60/#70/#71/#82/#83/#84/#85）整线落不位；owner 拍板过闸——一次性把
+m31 整线（底座+增量最终态）搬入 main，之后日常增量恢复。
+
+提交范围（chore/gate-minimax-m31，三段可独立 revert）：
+①底座：proj/minimax-m3.1 tip 的 m31 族 39 个新文件整线落位
+（models 11 / attention 9 / moe 3 / kernels 3 / jit csrc 2 / quant 1 /
+tests 10，+8866 行）；不携带 proj 线漂移（h3 multimodal 删改、
+__init__/environ/server_args 旧快照、0.5.23 bump、CI 删除）。
+②接线：pyproject 独立 entry point `hcu_minimax_m31`；
+deepep_fp8.around_ep_init 与 slimquant 权重后处理各加
+HCU_PLUGIN_MINIMAX_M31_DEEPEP opt-in gate（union 只加不改）。
+③契约：expected_hook_targets 并入 m31 13 条（742→755，去重回排）。
+
+kernel 半边说明：#85 的 pack_unit_scale_fp8_kv 实体已在 adapter-das
+#146（adapter main），plugin 侧只带调用接线，无重复实体。
+adapter 依赖核对：仅该符号（adapter main 已有）；sgl_kernel 头文件来自
+上游 sglang jit include，与既有 overlay 同惯例。
+
+验证（见 MR 正文实跑数字）：本地 L0 GREEN + unittest discover；
+bw47 容器跑 m31 族 10 件 CPU 回归 + 注册面冒烟。未验证项：整模
+GPU 推理与吞吐（m31 专项后续由模型线跑，不在过闸范围）。
