@@ -11,15 +11,69 @@ from pathlib import Path
 import subprocess
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class HcuRuntimeTests(unittest.TestCase):
+    def test_int8_deepgemm_respects_explicit_disable_env(self):
+        import importlib.util
+        from types import ModuleType, SimpleNamespace
+
+        def package(name):
+            module = ModuleType(name)
+            module.__path__ = []
+            return module
+
+        detection = ModuleType("hcu_sglang.utils.detection")
+        detection.is_hcu = Mock(return_value=True)
+        sglang_utils = ModuleType("sglang.srt.utils")
+        sglang_utils.get_bool_env_var = lambda name: os.environ.get(
+            name, "false"
+        ).lower() in ("true", "1")
+        moe = ModuleType("sglang.srt.layers.moe")
+        moe.get_moe_runner_backend = Mock(
+            return_value=SimpleNamespace(is_deep_gemm=lambda: True)
+        )
+        moe.get_moe_a2a_backend = Mock(
+            return_value=SimpleNamespace(is_deepep=lambda: True)
+        )
+        modules = {
+            "hcu_sglang.utils.detection": detection,
+            "sglang": package("sglang"),
+            "sglang.srt": package("sglang.srt"),
+            "sglang.srt.utils": sglang_utils,
+            "sglang.srt.layers": package("sglang.srt.layers"),
+            "sglang.srt.layers.moe": moe,
+        }
+        spec = importlib.util.spec_from_file_location(
+            "deepgemm_int8_under_test", ROOT / "hcu_sglang/layers/moe/deepgemm_int8.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+
+        with patch.dict(sys.modules, modules):
+            spec.loader.exec_module(module)
+            for disabled in ("0", "false"):
+                with self.subTest(value=disabled), patch.dict(
+                    os.environ, {"SGLANG_USE_DEEPGEMM_MOE": disabled}, clear=True
+                ):
+                    self.assertFalse(module.requested())
+                    moe.get_moe_runner_backend.assert_not_called()
+                    moe.get_moe_a2a_backend.assert_not_called()
+
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertTrue(module.requested())
+            moe.get_moe_runner_backend.assert_called_once()
+            moe.get_moe_a2a_backend.assert_called_once()
+
+
     def test_cold_import_keeps_startup_lightweight_and_uses_current_namespace(self):
         code = "import hcu_sglang,sys,json; print(json.dumps({'file':hcu_sglang.__file__,'loaded':[n for n in sys.modules if n.split('.')[0] in ['torch','aiter','sglang_hcu_plugin']]}))"
-        report = json.loads(subprocess.check_output([sys.executable, '-c', code], cwd=ROOT, text=True))
+        report = json.loads(subprocess.check_output(
+            [sys.executable, '-S', '-c', code], cwd=ROOT, text=True,
+            env={**os.environ, 'PYTHONPATH': str(ROOT)},
+        ))
         self.assertTrue(Path(report['file']).is_relative_to(ROOT / 'hcu_sglang'))
         self.assertEqual(report['loaded'], [])
 
@@ -69,6 +123,7 @@ import sys
 import types
 module = types.ModuleType('sglang.srt.arg_groups.arg_utils')
 module.is_record = lambda cls: False
+module.field_names = lambda cls: set(getattr(cls, '__annotations__', {}))
 sys.modules[module.__name__] = module
 from hcu_sglang.server_args import ensure_choices
 from hcu_sglang.layers.quantization.registry import _HCU_QUANTIZATION_NAMES
@@ -92,7 +147,8 @@ assert parser.parse_args(['--quantization', 'fp8']).quantization == 'fp8'
 assert 'torch' not in sys.modules
 assert not any(name.endswith('slimquant_w4a8_marlin') for name in sys.modules)
 """
-        result = subprocess.run([sys.executable, '-c', code], cwd=ROOT,
+        result = subprocess.run([sys.executable, '-S', '-c', code], cwd=ROOT,
+                                env={**os.environ, 'PYTHONPATH': str(ROOT)},
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

@@ -44,7 +44,7 @@ flowchart TB
 |---|---|---|---|
 | [根 README](../README.md) | 定位、状态、首次使用、要点、CI 与约束 | 所有人首次接手 | 新能力/入口/阶段变化 |
 | [任务与 Skill 使用指南](reading-guide.md) | 任务、操作文档与 Skill 的对应关系 | 准备开始一个任务 | 新增或调整文档职责 |
-| [架构设计](architecture.md) | 独立仓与组合运行、现有目录、未来结构 | 设计或评审接口 | 包、目录、依赖关系变化 |
+| [架构设计](architecture.md) | 独立仓与组合运行、当前文件职责、GLM W4A8 分层和整理顺序 | 设计或评审接口 | 包、目录、依赖关系变化 |
 | [职责治理](governance.md) | 代码归属、跨仓依赖、目标所有权、证据状态 | 拆需求、处理重叠目标 | 边界或兼容规则变化 |
 | [安装与启用](installation.md) | wheel/editable、入口、实际加载、服务与停用 | 使用已有运行时插件 | 运行时版本/安装/加载方式变化 |
 | [工程初始化指南](first-plugin.md) | 创建包→安装→真实 Hook→启停断言 | 第一次开发插件 | pinned API 或案例变化 |
@@ -107,3 +107,5 @@ flowchart TB
 操作细节与示例维护在对应文档，Skill 保留任务决策、约束和引用；二者互相链接。新增 Skill 同步任务导航、元信息、数量与结构检查，保持完整仓库的共享相对路径。
 
 当前逐路径差异处置见 [迁移执行台账](../plans/sglang-das-execution.json)，维护规则见 [三方迁移](migration.md#全量差异执行台账)；当前 Hook 合同见 [目标清单](hcu-sglang-development.md#历史-json-快照)（`hcu-sglang-targets.json`）。
+
+GLM5.2 INT4 的单实例配方、适配过程与历史结果边界见 [GLM5.2 INT4 适配与0518对照](glm52-int4-adaptation.md)。

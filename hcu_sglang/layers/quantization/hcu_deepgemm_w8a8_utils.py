@@ -19,8 +19,8 @@ def get_hcu_gfx_arch() -> str:
     return arch.split(":")[0].lower()
 
 
-def is_hcu_gfx936() -> bool:
-    return get_hcu_gfx_arch() == "gfx936"
+def is_hcu_pair32_int8() -> bool:
+    return get_hcu_gfx_arch() in ("gfx936", "gfx938")
 
 
 def _register_runtime_buffer(
@@ -72,16 +72,7 @@ def prepare_w8a8_int8_deepgemm_weights(layer: torch.nn.Module) -> None:
     from sglang.srt.layers.moe.utils import get_deepep_mode
 
     deepep_mode = get_deepep_mode()
-    if deepep_mode.is_normal():
-        from deepgemm import marlin_i8_contiguous_weight
-
-        def pack_weight(weight: torch.Tensor) -> torch.Tensor:
-            return marlin_i8_contiguous_weight(
-                weight,
-                shuffle_unique=0,
-                low_memory=True,
-            )
-    elif use_asm:
+    if deepep_mode.is_normal() or use_asm or arch in ("gfx936", "gfx938"):
         need_contiguous_layout = deepep_mode.enable_normal()
         need_masked_layout = deepep_mode.enable_low_latency()
         from deepgemm import marlin_i8_contiguous_weight
@@ -93,9 +84,13 @@ def prepare_w8a8_int8_deepgemm_weights(layer: torch.nn.Module) -> None:
                 low_memory=True,
             )
 
-        pack_masked_weight = _pack_w8a8_int8_asm_masked_weight
-    elif arch == "gfx936":
-        from deepgemm import pack_w8a8_gfx936_weight_to_w6 as pack_weight
+        if need_masked_layout:
+            if use_asm:
+                pack_masked_weight = _pack_w8a8_int8_asm_masked_weight
+            else:
+                from deepgemm.group_gemm_weight_pack import (
+                    pack_i8_weight_pair32 as pack_masked_weight,
+                )
     else:
         from deepgemm.m_group_gemm import (
             pack_int8_weight_enk_to_w6_low_latency as pack_weight,
@@ -108,12 +103,12 @@ def prepare_w8a8_int8_deepgemm_weights(layer: torch.nn.Module) -> None:
     layer._w8a8_int8_w2_weight_shape = tuple(w2_weight.shape)
 
     with torch.no_grad():
-        if need_contiguous_layout:
-            w13_weight_deepgemm = pack_weight(w13_weight).detach()
-            w2_weight_deepgemm = pack_weight(w2_weight).detach()
         if need_masked_layout:
             w13_weight_deepgemm_masked = pack_masked_weight(w13_weight).detach()
             w2_weight_deepgemm_masked = pack_masked_weight(w2_weight).detach()
+        if need_contiguous_layout:
+            w13_weight_deepgemm = pack_weight(w13_weight).detach()
+            w2_weight_deepgemm = pack_weight(w2_weight).detach()
 
     if need_contiguous_layout:
         _register_runtime_buffer(layer, "w13_weight_deepgemm", w13_weight_deepgemm)
@@ -135,3 +130,12 @@ def prepare_w8a8_int8_deepgemm_weights(layer: torch.nn.Module) -> None:
     del layer.w2_weight
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+
+def run_w8a8_int8_contiguous_gemm(layer, a, b, output, m_indices):
+    from deepgemm import m_grouped_i8_gemm_nt_contiguous
+
+    return m_grouped_i8_gemm_nt_contiguous(
+        a, b, output, m_indices, shuffle_unique=0,
+    )

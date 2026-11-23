@@ -16,8 +16,9 @@ def register() -> None:
 
     install_aiter_compat()
 
-    from hcu_sglang.environ import register_envs
+    from hcu_sglang.environ import apply_qwen36_serve_defaults, register_envs
 
+    apply_qwen36_serve_defaults()
     register_envs()
 
     if os.environ.get("HCU_KIMI31_DAY0") == "1":
@@ -42,8 +43,13 @@ def register() -> None:
         base_backend,
         debug_flash_mla_adapter,
         dsa_kernels,
+        dsa_empty_batch,
+        dsa_lightop_mla,
+        dsa_kpool_short,
+        dsa_packed_kv,
         dsa_topk,
         current_dsa,
+        hisparse,
         dsv4_compressor,
         flashattention_backend,
         index_topk_share,
@@ -56,12 +62,16 @@ def register() -> None:
     from hcu_sglang.layers.moe import alignment, aiter_w4a8, lightop_runner, mega_moe, topk, standard_dispatcher
     from hcu_sglang.mem_cache import allocation as mem_cache_allocation
     from hcu_sglang.mem_cache import (
+        cp_hicache_write_ack,
+        cp_prefix_consensus,
         dsa,
         dsv4,
+        glm5_layer_split,
         hcu_host_pool,
         hcu_mha_pool,
         kv_cache_dtype,
         mla,
+        mamba_checkpoint_locks,
         swa,
     )
     from hcu_sglang.models import bailing_moe
@@ -72,7 +82,8 @@ def register() -> None:
     from hcu_sglang.models import minimax_m2
     from hcu_sglang.models import utils as model_utils
     from hcu_sglang.models.deepseek import register_hooks as register_deepseek
-    from hcu_sglang.models.qwen import qwen2, qwen3, qwen3_moe, qwen3_5
+    from hcu_sglang.models.qwen import qwen2, qwen3, qwen3_5, qwen3_moe, silu_int8
+
 
     jit_overlay_loader.register_hooks()
     configs.register_hooks()
@@ -94,8 +105,16 @@ def register() -> None:
     flashattention_backend.register()
     debug_flash_mla_adapter.register_hooks()
     dsa_kernels.register_hooks()
+    dsa_empty_batch.register_hooks()
+    dsa_lightop_mla.register_hooks()
+    dsa_kpool_short.register_hooks()
+    cp_prefix_consensus.register_hooks()
+    cp_hicache_write_ack.register_hooks()
+    mamba_checkpoint_locks.register_hooks()
+    dsa_packed_kv.register_hooks()
     dsa_topk.register_hooks()
     current_dsa.register_hooks()
+    hisparse.register_hooks()
     dsv4_compressor.register_hooks()
     index_topk_share.register_hooks()
     triton_hcu.register_hooks()
@@ -169,8 +188,14 @@ def register() -> None:
     from hcu_sglang.utils.detection import is_hcu
     if is_hcu():
         from hcu_sglang.layers.moe import deepep_current, deepep_fp8
+        from sglang.srt.environ import envs
+
         deepep_current.register_hooks()
         deepep_fp8.register_hooks()
+        if envs.SGLANG_HCU_GLM53_FP8_K1_AUTO_BUILD.get():
+            from hcu_sglang.layers.moe import glm53_fp8_k1_indirect
+
+            glm53_fp8_k1_indirect.register_hooks()
     aiter_w4a8.register_hooks()
     lightop_runner.register_hooks()
     mega_moe.register_hooks()
@@ -189,6 +214,7 @@ def register() -> None:
     mem_cache_allocation.register_hooks()
     kv_cache_dtype.register_hooks()
     swa.register_hooks()
+    glm5_layer_split.register_hooks()
     hcu_host_pool.register_hooks()
     hcu_mha_pool.register_hooks()
     mla.register_hooks()
@@ -204,11 +230,14 @@ def register() -> None:
 
     register_legacy()
     register_deepseek()
+    from hcu_sglang.layers import glm53_decode
+    glm53_decode.register_hooks()
     model_utils.register_hooks()
     qwen2.register()
     qwen3.register()
     qwen3_moe.register()
     qwen3_5.register()
+    silu_int8.register()
     from hcu_sglang.models.qwen import qwen4_exp
     qwen4_exp.register_hooks()
     from hcu_sglang import speculative_dspark
