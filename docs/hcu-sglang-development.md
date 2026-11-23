@@ -4290,8 +4290,6 @@ HCU 插件在 CLI 进程注册时为 `Qwen3.6-35B-A3B` 和 `Qwen3.6-35B-A3B-Chan
 回归测试覆盖标准 CLI、位置参数、兼容启动入口、显式禁用、其他模型与非 HCU。与 W8A8 FP8 checkpoint 排除项测试合计 11 项通过。完整 EvalScope 在本次默认值变更前运行，当前实机复核关注零 `export` 启动与子进程继承。
 nmz16 gfx938 两组 TP4 在移除配方环境变量后，均完成 eager Prefill / Full Decode 启动和确定性短答，结束原因为 `stop`。两组的六个进程均继承各自配方，只有 Channel FP8 注入 ModelScope 默认值。
 ## 2026-11-19 GLM-5.3 Channel FP8 基础运行时
-
-## 2026-11-19 GLM-5.3 Channel FP8 基础运行时
 以官方 SGLang v0.5.22 为宿主。移入 fork 的 Channel FP8 量化、MoE、MLA、
 KV/index cache 和模型 Hook，并加入显式的 prefill、decode 候选开关。部署所需
 算子入口、模型条件和供应商扩展来源见[配置管理](configuration.md)。
@@ -4528,6 +4526,38 @@ routed FP8 从 380.0 降到 76.6 微秒，数据 dispatch 与共享 GEMM 的
 本次正式实现的检查范围为 CI lint、源码语法与文档导览。设备结果属于
 隔离试验，正式提交的 GPU 复采、真实请求端到端精度和 graph replay
 仍待验证。
+
+## 2026-11-20 minimax-M3.1（m31）整线过闸进 main
+
+分叉背景：m31 底座文件 main 从未有过，release/proj→main 增量挑选组
+（#60/#70/#71/#82/#83/#84/#85）整线落不位；owner 拍板过闸——一次性把
+m31 整线（底座+增量最终态）搬入 main，之后日常增量恢复。
+
+提交范围（chore/gate-minimax-m31，段间可独立 revert）：
+①底座：proj/minimax-m3.1 的 m31 族新文件整线落位（首版 39 文件
++8866 行；models/attention/moe/kernels/jit csrc/quantization/tests）；
+不携带 proj 线漂移（h3 multimodal 删改、__init__/environ/server_args
+旧快照、0.5.23 bump、CI 删除）。
+②接线：pyproject 独立 entry point `hcu_minimax_m31`；
+deepep_fp8.around_ep_init 与 slimquant 权重后处理各加
+HCU_PLUGIN_MINIMAX_M31_DEEPEP opt-in gate（union 只加不改）。
+③契约：expected_hook_targets 并入 m31 条目（去重回排）。
+④快照刷新（review 拍板「以 proj tip 为准」）：proj 线推进 6 笔
+（#99 合并 + EPLB live 权重/per-step 记录 + shared-expert overlap
+prefill/decode + HiSparse PD decode 对齐 + SwiGLU/INT8 CP-prefill
+融合）后整族重对齐 ba402d9——14 改 + 5 新（eplb/minimax_m31、
+moe/minimax_m31_prefill_overlap、models/_minimax_rocm_pinned_kv、
+tests eplb/hisparse_mapping）；共享接线 deepep_current 增
+register_deepep_normal_combine_hook（EPLB 用，proj hunk 原样）。
+⑤bot review P3：swiglu_m31_int8 的 lightop 探测改降级不抛
+（find_spec 对 dotted name 会 import 父包；env 关短路语义不变）。
+契约并入 proj tip 新增 7 条 m31 族 target（m3_vl 随多模态范围排除）。
+
+kernel 半边说明：#85 的 pack_unit_scale_fp8_kv 实体已在 adapter-das
+#146（adapter main），plugin 侧只带调用接线，无重复实体。
+adapter 依赖核对：仅该符号（adapter main 已有）；sgl_kernel 头文件来自
+上游 sglang jit include，与既有 overlay 同惯例。
+
 ## 2026-11-20 PR81 review runtime follow-up
 
 以下保留早期候选的诊断经过。后置覆盖 layer IDs 和重复 mask 工厂已在下节
