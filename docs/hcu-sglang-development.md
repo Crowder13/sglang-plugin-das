@@ -32,6 +32,10 @@
 - [2026-11-18：GLM-5.3 FP8 absorb BMM 分发对齐](#2026-11-18-glm-53-fp8-absorb-bmm-分发对齐)
 - [2026-11-19：DeepEP 清理接口兼容](#2026-11-19-deepep-清理接口兼容)
 - [2026-11-19：GLM-5.3 FP8 稳态 prefill 优化](#2026-11-19-glm-53-fp8-稳态-prefill-优化)
+- [2026-11-20：gfx938 Qwen attention 门控与 FP8 量化融合](#2026-11-20-gfx938-qwen-attention-门控与-fp8-量化融合)
+
+- [2026-11-20：gfx938 Qwen GDN 门控归一化与 FP8 量化融合](#2026-11-20-gfx938-qwen-gdn-门控归一化与-fp8-量化融合)
+
 - [附录：布局、操作方式与汇总](#附录布局操作方式与汇总)
 
 两份早期独立开发记录已全文收录（卷内同链）。历史结果不代表当前代码已重新验证。
@@ -721,6 +725,16 @@ bw46 HCU 4/5 在同一容器、同一 DTK 和同一 TP2 配置串行运行基线
 单请求合成输入，固定输出 128 token，丢弃首轮后各取七次中位数。输入 128 token 时，TTFT 244.95→226.99 ms，decode 131.20→132.27 tok/s。输入 2048 token 时，TTFT 251.74→242.41 ms，decode 131.01→132.09 tok/s。两组负载的每轮请求均执行 32 轮 verify。这组单卡对串行对照用于烟测，TTFT 观测区间重叠。其他模型、批量和完整精度评测未执行。
 
 L0、三个定向测试、导览生成和 `git diff --check` 通过。完整 unittest 在当前 venv 留有两项启动测试失败，干净 HEAD 复现同样失败。原始算子与服务证据保存在本轮服务器实验目录。
+
+## 2026-11-20 gfx938 Qwen GDN 门控归一化与 FP8 量化融合
+
+`SGLANG_HCU_QWEN_GDN_RMS_FP8_FUSION=1` 为 gfx938 的 Qwen3.5/3.6 GDN 开启按 head 的 RMSNorm、SiLU 门控和按 token E4M3FN 量化。默认关闭。准入条件包括 BF16、128 维 value head、本 rank 的行并行输入、可接收预量化输入的动态 channelwise compressed-tensors FP8，以及未启用 sequence parallel。关闭开关或遇到不适用配置时，调用当前生效的原 forward。
+
+融合点位于 GDN recurrence 和 DP-Attention padding 之后。融合 kernel 保留 BF16 舍入，跨本 rank 的全部 head 计算一个 FP32 scale，支持 compact gate 和带 stride 的 prefill gate。`out_proj` 接收 `(FP8 activation, FP32 scale, BF16 dtype)`，现有 compressed-tensors GEMM 和 TP reduction 继续处理输出。SGLang 的 Quark small-M FP8 分支保持原有优先级。
+
+优先使用 [LightOP PR #183](https://github.com/HYGON-AI/lightop/pull/183) 的接口。旧版 wheel 使用 plugin 携带的同一 gfx938 Triton 实现。已发起 kernel 的错误沿原调用链上报。
+
+以 plugin release `c47683ec` 和 SGLang v0.5.22 `baa9befa` 为基线。CPU 合同覆盖开关、设备和量化方案准入、provider 选择、prefill/decode/target verify 的 FP8 数据直通及 TP2 reduction。gfx938 kernel 可离线编译。nmz26 满卡，模型规模的 gfx938 数值、Graph 重放和性能待验证。
 
 ## 附录：布局、操作方式与汇总
 
@@ -2740,6 +2754,62 @@ main 整理已同步正在评测的三个 KV 修复，并移除未部署的 raw 
 参考环境为 bw46 `zhuwenbo_sgl_1024` SGLang 0.5.18，TP4 NEXTN 3/1/4 eager；对 LightOp 做了 top-k/top-p 频数测试。0522 使用 `--kv-cache-dtype fp8_e5m2` 时，在随机采样前的 full-attention KV stride 解析处出现 `ValueError: unexpected KV buffer ndim=4`，故服务验证使用默认 KV dtype，不能与参考配置作严格性能 A/B。测试日志和 trace 位于 bw46 的 `/sgl/deploy-bw46-qwen38-20261109/mtp-random-adapt-20261109/` 及 `/sgl/deploy-bw46-qwen38-20261109/decodegraph-vision-20261109-01/`。
 
 
+## 2026-11-20 Attention 输出的 sigmoid mul 和 INT8 量化
+
+新增独立 Triton 接口 `sigmoid_mul_per_token_int8_quant(attn_output, gate)`。
+输入为连续的 BF16 attention 输出和同设备的 BF16 gate。gate 支持最后一维步长为 1
+的二维张量及三维分头视图。以 [SGLang FP8 分支](https://github.com/sgl-project/sglang/blob/baa9befa381511cd4d56f83980951e5a45fffc6d/python/sglang/kernels/ops/elementwise/elementwise.py#L419)
+为参考，按 token 计算 sigmoid × attention output，先舍入到 BF16，再用整行 FP32
+absmax、1e-10 下限和 nearbyint 生成 INT8 激活与每 token 一个 FP32 scale。
+算子保持输入只读。
+
+bw46 HCU 上，TP2 的 3,072 宽分片和 1、4、16、128、512、2,048 token 的带 stride
+gate 对拍通过，INT8 激活和 scale 同现有 SGLang sigmoid × mul 加 LightOp
+per-token INT8 逐元素一致。二维带 stride gate、全零行、空输入、无效 shape
+和改变输入的 Graph replay 用例通过。
+
+3072 宽三维 strided gate 的 Graph replay 微测以 SGLang 原地 sigmoid × mul 加
+LightOp 分段 INT8 kernel 为基线。1/4/16/128/512/2,048 token 的基线与融合耗时比
+依次为 1.06/1.07/1.10/1.15/0.96/1.20。测试用 gate 为 16，使 BF16 activation
+在基线的重复原地 replay 过程中保持恒定。计时范围为两步算子和融合算子。
+
+按 3072 宽专门增加四 wave 的三段归约。每个 program 读三段 1024 元素，
+先逐元素合并绝对值再做整行归约；其他宽度沿用通用路径。gfx936 代码对象
+中，旧版和新版的 `next_free_vgpr` 分别为 57、40，静态 `v_exp_f32`
+指令分别为 16、12，barrier 数均为 2，均未使用 scratch。六种 3072 宽
+token 数继续与两步基线逐元素匹配，Graph 更新输入及二维 gate 也已复验。
+
+| Token 数 | 两步基线（µs） | 原融合（µs） | 3072 分段融合（µs） |
+| ---: | ---: | ---: | ---: |
+| 4 | 4.411 | 4.076 | 3.460 |
+| 512 | 15.177 | 15.690 | 12.265 |
+| 2,048 | 61.557 | 51.112 | 40.148 |
+
+同卡随机穿插三种已预热 Graph 的测量顺序，记录 11 轮的中位数。
+
+### Qwen full attention 接入
+
+`SGLANG_HCU_QWEN_ATTN_SIGMOID_INT8_FUSION=1` 将融合接到 sigmoid gate 与
+`self_attn.o_proj` 之间。开关默认关闭，和 GDN、SiLU 的融合开关独立。
+仅对 HCU 上已有 gate、使用动态对称 compressed-tensors W8A8、输入已分片的
+`o_proj` 生效。BF16 attention 输出满足布局条件时，投影直接消费 INT8 激活
+和 FP32 scale。SP、编译及不支持的配置使用原有路径。
+
+
+bw46 使用同一 plugin 工作树、相同 Qwen3.8-27B Channel INT8、TP2、MTP NEXTN 3/1/4
+和完整 target-verify Graph BS1。EvalScope 1.15.0，greedy，seed 42，关闭 thinking，
+并发 8，最大输出 4096 token。GDN + SiLU 对照组在 4/5 卡，三融合组在 6/7 卡。
+
+| HumanEval pass@1 | 通过数 |
+| --- | ---: |
+| GDN + SiLU（同轮） | 159/164 |
+| GDN + SiLU + attention sigmoid | 163/164 |
+| GDN + SiLU（上一轮） | 160/164 |
+
+三组均无输出截断。两个对照中通过的题在三融合组均通过。此数据为单次模型运行的
+得分对照。服务日志确认两 rank 在 target verify、decode 和 prefill 均命中融合。
+门控、投影直通及 attention 调用次数的三项接入测试通过。
+
 ## 2026-11-09 Qwen3.8 FP8 E5M2 KV 的 HCU FA 路径
 
 用户的 Qwen3.8-27B（`Qwen3_5ForConditionalGeneration`）使用 `fa3`、page 64 和 `fp8_e5m2` 时，官方配置 pass 原先将 backend 改为 Triton，而 PR #22 引入的 HCU pool 仍存储四维 BHSD；真实图片请求因此在 Triton 的三维 KV stride 解析处失败。本次在 plugin 的既有配置 Hook 中补充 Qwen3.5 主模型架构，并在 `dtype=auto` 时读取解析后的模型 dtype。保留物理 HCU、gfx936、BF16、page 64、HCU FA layout、fa3 与 E5M2 的组合限制，其他配置继续调用当前有效 original。
@@ -2980,6 +3050,44 @@ bw47 环境本身跑不动这套组合，需要先补五项前置条件（均为
 5. `pip install -e . --no-deps --no-build-isolation`：bw47 没有 editable 安装，`sglang.srt.plugins` entry_point 为空（`[]`），插件完全不会被加载。安装前需 `git config --global --add safe.directory` 两仓路径，否则 setuptools 读版本号时因 dubious ownership 失败。
 
 `hook_guard` 在 bw47 上还额外验证了一个设计点：`apply_hooks` 用 `try/finally` 发汇总，即使 `register()` 中途抛异常（如上述缺 scipy），汇总仍会照常打印——日志里能看到汇总行出现在 `register()` 失败之后。
+## 2026-11-20 Qwen MLP 的 SiLU + mul + INT8 量化
+
+`SGLANG_HCU_QWEN_SILU_INT8_FUSION=1` 启用 HCU 上 Qwen3.5/3.8 所用
+`Qwen2MoeMLP.forward` 的 `gate_up_proj → SiLU + mul + 逐 token INT8 量化 → down_proj`。
+开关默认关闭，与输入归一化和 GDN 输出融合独立。通过
+`lightop.activation.fuse_silu_mul_quant` 将 INT8 激活和 FP32 scale 直接交给
+动态对称 compressed-tensors W8A8 的 rank-local `down_proj`。GEMM 输出 dtype
+和 TP reduction 沿用现有路径。FP4、sequence parallel、编译、RL 确定性模式、
+不兼容输入和缺少 LightOp 入口均继续走原有路径。
+
+在 bw46 上按 Qwen3.8-27B INT8 TP2 的 rank-local 8,704 维 MLP 宽度做算子对拍。
+随机 BF16 输入的 1、4、32、128、512、2,048 token 的 INT8 激活与 FP32 scale
+均匹配现有两算子路径。全零行的融合与基线 scale 分别为 0 和约 7.87e-13，
+反量化结果均为 0。新增门控和投影用例及既有 GDN 用例共 5 项通过。
+
+同卡 Graph replay 微测按每次 activation + quant 的耗时统计。分片宽度 8,704，
+1 token 为 8.54 → 6.83 微秒，4 token 为 8.67 → 6.87 微秒，
+512 token 为 45.24 → 30.32 微秒。六个点耗时比为 1.25–1.49×。
+
+bw46 以 TP2、MTP NEXTN 3/1/4、完整 verify Graph BS1 同时打开 GDN 和 MLP 融合。
+两 rank 在 target-verify Graph 捕获时均命中 MLP 融合。真实 chat 请求均以 stop
+结束，数学和地理短答与当前基线相同。64-token 原生生成文本相同，两组均执行
+16 轮 MTP verify。
+
+
+以同一 plugin 工作树在同一对 HCU（6/7）按顺序运行两组 EvalScope 1.15.0 HumanEval，
+两组都开 GDN，仅切换 SiLU。两组使用 TP2、MTP NEXTN 3/1/4、完整 verify Graph
+BS1、greedy、seed 42、关闭 thinking、4096 输出 token 上限和请求并发 8。
+逐题输入和标准答案一致，两个服务的有效运行配置一致。
+
+| HumanEval pass@1 | 通过数 | 得分 |
+| --- | ---: | ---: |
+| 只开 GDN | 159/164 | 96.95% |
+| GDN 和 SiLU 同开 | 160/164 | 97.56% |
+
+两组均完成全部 164 题且无截断。有 2 题仅只开 GDN 组通过、3 题仅双融合组通过。
+前一版本的只开 GDN 历史成绩为 161/164。当前对照覆盖单轮模型精度。
+
 ## 2026-11-05 DeepSeek V4.1 TP8 首次生成的 KV 索引与 DSPARK 结果
 
 固定 official baa9befa、plugin 0aa4114d、adapter 918f850d。原配方在 gfx938
@@ -4289,6 +4397,55 @@ HCU 插件在 CLI 进程注册时为 `Qwen3.6-35B-A3B` 和 `Qwen3.6-35B-A3B-Chan
 
 回归测试覆盖标准 CLI、位置参数、兼容启动入口、显式禁用、其他模型与非 HCU。与 W8A8 FP8 checkpoint 排除项测试合计 11 项通过。完整 EvalScope 在本次默认值变更前运行，当前实机复核关注零 `export` 启动与子进程继承。
 nmz16 gfx938 两组 TP4 在移除配方环境变量后，均完成 eager Prefill / Full Decode 启动和确定性短答，结束原因为 `stop`。两组的六个进程均继承各自配方，只有 Channel FP8 注入 ModelScope 默认值。
+## 2026-11-19 GLM-5.3 Channel FP8 基础运行时
+以官方 SGLang v0.5.22 为宿主。移入 fork 的 Channel FP8 量化、MoE、MLA、
+KV/index cache 和模型 Hook，并加入显式的 prefill、decode 候选开关。部署所需
+算子入口、模型条件和供应商扩展来源见[配置管理](configuration.md)。
+上游的模型注册及 P/D 调度入口保留，沿用 Scheduler 注册时安装的兼容方法。
+## 2026-11-20 gfx938 Qwen attention 门控与 FP8 量化融合
+
+设置 `SGLANG_HCU_QWEN_ATTN_SIGMOID_FP8_FUSION=1` 后，Qwen3.5/3.6 在 gfx938 上可把 attention 输出的 sigmoid 门控和逐 token E4M3FN 量化合成一次 launch。默认关闭。融合仅用于非空 BF16 输入、匹配的 attention/gate 布局和 rank 本地输入的 compressed-tensors 动态 token / 通道权重 FP8 `o_proj`。复用原有 FP8 GEMM 和 TP 归约。序列并行、torch.compile、原生 FP8 tuple 分发及其他不满足条件的路径沿用已有实现。
+
+优先使用 LightOP 的 `fuse_sigmoid_mul_fp8_quant` 导出。旧版 LightOP 未提供该导出时使用插件内同一 Triton 实现，算子来源见 [LightOP PR #185](https://github.com/HYGON-AI/lightop/pull/185)。融合保留门控相乘后的 BF16 舍入，再计算 FP32 scale 及 E4M3FN 输出。
+
+`python3 tests/runtime/qwen_attention_fp8.py -v` 的六项接入单测通过，覆盖开关注册、硬件/量化准入、算子选择、回退及真实 RowParallelLinear 对 FP8 输入和 TP2 归约的调用契约。单测使用 CPU 和模拟的 GPU 分发。
+
+在 gfx938 上复用 Qwen3.6-27B Channel FP8 服务的实际量化和 GEMM 入口，用 3072 列 BF16 attention 输出和分头步长的 gate 测试 11 种 token 数。eager 和 Graph replay 各比较 5,621,760 个 E4M3FN 编码、1,830 个 FP32 scale 和 9,369,600 个 GEMM BF16 输出，均逐位一致。服务使用插件内置 Triton 算子，两个 TP rank 在 EXTEND、DECODE、TARGET_VERIFY 和 DRAFT_EXTEND_V2 都记录到命中。
+
+HumanEval 使用 SGLang 0.5.22、DTK 26.10、TP2/PP1、FA3、EAGLE 3/1/4、FP8 E4M3 KV、Graph 和 EvalScope 1.15.0，关闭 thinking，temperature 0，seed 42，最多 4,096 个生成 token。基线插件为 `c47683ec37984d382b960aa900bdedbf9cbfe059`。并发 8 时，关闭融合的两轮完整 Pass@1 分别为 120/164 和 118/164，94/164 道题的生成文本相同。开启融合为 118/164，与两轮基线分别有 97/164 道题的生成文本相同。
+
+并发 1 时，两组都先清空 radix cache，使用同一对 gfx938 设备。两组 Pass@1 均为 114/164（69.51%），164 道题的生成文本和通过判定全部一致，评测无执行错误。清理本次启动的服务后确认两张卡已释放。
+
+`SGLANG_USE_LIGHTOP_CHANNEL_FP8=1 python3 tests/runtime/compressed_fp8.py -v` 的 14 项现有量化回归通过。导览已重新生成，并在桌面和窄屏浏览器中检查新增目录锚点和导航。
+
+## 2026-11-19 Qwen GDN 输出投影的动态 INT8 融合
+
+`SGLANG_HCU_QWEN_GDN_RMS_INT8_FUSION=1` 启用 Qwen GDN recurrence 后、`out_proj`
+前的 gated RMSNorm 和逐 token 对称 INT8 量化。开关默认关闭，仅在 HCU 注册。
+适用输入为 BF16、128 维 value head，输出投影采用 compressed-tensors 动态对称
+W8A8 且输入已按 TP 切分。投影直接消费 INT8 激活与 FP32 scale，沿用现有 GEMM
+与 TP reduction。Sequence parallel、编译及其他不满足融合条件的路径使用原有实现。
+
+优先使用 LightOp 的 `gated_rms_norm_per_token_int8_quant`。当前依赖版本缺少该 API
+时，通过 plugin 内对应的 Triton kernel 兼容。此项和输入层的
+`SGLANG_HCU_QWEN_RMS_INT8_FUSION` 独立。
+
+bw46 使用 Qwen3.8-27B Channel INT8、TP2、MTP NEXTN 3/1/4 和完整 decode Graph
+（BS1）。两组使用 EvalScope 1.15.0、greedy、seed 42、关闭 thinking，单题上限
+4096 个输出 token。基线在 HCU 0/1，融合组在 HCU 6/7，均沿用现有 LightOp wheel。
+两 rank 在 prefill 和 target-verify Graph 捕获期均记录到融合分发。
+
+| 数据集 | 关闭融合 | 开启融合 |
+| --- | ---: | ---: |
+| HumanEval pass@1 | 160/164（97.56%） | 161/164（98.17%） |
+| MATH-500 accuracy | 470/500（94.00%） | 470/500（94.00%） |
+
+HumanEval 有 1 题仅基线通过、2 题仅融合通过。MATH-500 两组各有 10 题仅本组正确，
+分别有 30 题和 26 题达到输出 token 上限。精度结果覆盖本轮配置和评分口径。
+
+将此变更同步到 0.5.22 发布分支后，以同一 SGLang 版本和模型参数启动融合副本。
+健康检查、真实接口生成和两 rank 的融合分发通过。64 token 请求执行 16 轮 MTP
+verify。新版 GDN 三项单测、原有 RMSNorm INT8 三项单测和 L0 检查通过。
 
 
 
@@ -4346,6 +4503,211 @@ W4A8 MoE 对比包含 M=4/128/1024/4096/16384 及浮点、显式 INT8 两种输�
 40960/40963/327680 行的零值及幅值 1e-3/1/8/300 共 15 组压力比较中，
 codes/scale 全部逐位一致。宽度 640、356000 行组件耗时 2.273→1.466ms，
 约 1.55×；40960 行 0.281→0.176ms，约 1.60×。
+
+设备性能证据来自两节点 BW1300、TP8/CP8/EP8、并发 8 的隔离试验。
+匹配输入和缓存后，8 rank 的稳态 1/5/2 对齐，等待量化完成使 bs=5
+routed FP8 从 380.0 降到 76.6 微秒，数据 dispatch 与共享 GEMM 的
+重叠从 2.7 增到 66.5 毫秒。关闭 profiler 的 ABBA 中，稳态整波中位数
+从 4.643 降到 4.605 秒。此前的同输入原生对照为 4.306 秒，整体仍
+慢约 7.0%。证据见隔离试验 `quant-event-ab-20261119-1643/RUN.md`。
+本次正式实现的检查范围为 CI lint、源码语法与文档导览。设备结果属于
+隔离试验，正式提交的 GPU 复采、真实请求端到端精度和 graph replay
+仍待验证。
+
+## GLM-5.3 FP8 DCP Graph KV 占位写入
+
+HCU DSA FP8 KV 池把 Graph 的占位槽放在最后一个可分配页之后。
+普通 decode 每请求预留一行，EAGLE 根据 draft 分支数和 verify/extend
+所需的最大 draft token 数确定行数。启用 prefill Graph 时同时考虑其
+最大 token bucket。取各阶段最大值并向上按页对齐。DCP=1、仅 eager
+和已转换为本地槽号的池沿用原分配路径。
+
+在个人 fork 的 `6d8ad63` 基线上，本地复现了小 batch 写到最后一个
+可分配页以及普通 decode batch 128 触发容量断言。修复后用 CPU 桩
+执行池分配和槽号转换，覆盖普通 decode、EAGLE、prefill bucket、
+eager 和 DCP=1。DCU 上的服务、换输入 Graph replay、调用对齐、
+性能和端到端精度待验证。
+
+DCP4 验收配方使用 FP8 KV、64 token 页、`ag_rs` 和双阶段 `flashmla_kv`。
+EAGLE 需要 PP1、attnCP1、DP attention，attention TP 与 DCP 均为 4
+且组内 rank 一致。DCP 运行时关闭 prefill CP、fused DSA top-k、
+HiSparse、HiCache 和 symmetric memory。首次实机复验应核对同步上游后
+首次 draft 的 TopK 接线，再对照原生采集调用和换输入 Graph replay。
+
+DCP4 的 EAGLE 启动校验读取实际生效的 DP attention 状态。用
+`--attn-dp-size 2` 启动时，旧的 `enable_dp_attention` 参数仍可能为
+False，导致已启用 DP attention 的配方被拒绝。在 `85c1b05` 基线上
+应用此补丁后，两节点 DCP4 服务完成 target verify、draft decode 和
+draft extend 的 full Graph 捕获，三条真实对话均返回预期答案。
+该结果覆盖启动和小样本对话。
+
+## GLM-5.3 Channel FP8 HiSparse IFB
+
+GLM-5.3 Channel FP8 在 PP1、DCP1 的单服务模式下复用 prefill staging。
+Prefill 写入 packed FP8 KV，host pool 备份完成后进入 HiSparse decode。
+Prefill 和 decode 均使用 FlashMLA KV。Mooncake 或 fake 的传输校验在
+PD decode 路径生效。非融合 DSA TopK 沿用 HCU 原生 TopK 的索引顺序。
+
+实机冒烟使用个人 fork `85c1b05` 上的补丁 `11f11e1`。两节点共八张
+gfx938，attention DP8 / EP8，EAGLE 5/1/6，full decode Graph。
+三条真实对话均返回预期答案。本次上游移植执行 lint 和结构检查。
+
+## 2026-11-20 GLM-5.3 LayerSplit 的 Index-K 容量预算
+
+从 [sglang-das #67](https://github.com/maxiaobetter/sglang-das/pull/67) 迁入
+`PP1`、`DCP1`、Prefill CP LayerSplit 与单层 EAGLE 的预算修正。插件在
+宿主完成池配置器初始化后，按每个 CP rank 的实际 target/draft 层和
+Index-K 层计费，再取最大值。Main-KV scratch 共用一份，两个 Index-K
+scratch 以及各自的 INT8 workspace 按分配情况计入预算。
+
+官方 v0.5.22 的 LayerSplit 查询仅用于 target。使用共享池的 GLM-5.3 draft
+沿用 target 池的 CP rank 和规模，将单层 draft 的 owner 移到最后一个 CP rank。
+本轮验证范围为本地 lint、语法及结构检查。节点上的实际容量与显存占用待验证。
+
+## 2026-11-20 GLM-5.3 HiCache L2 的 Index-K 层号映射
+
+参考 [sglang-das #34](https://github.com/maxiaobetter/sglang-das/pull/34)，
+GLM-5.3 的 L2 Index-K host pool 沿用官方 v0.5.22 的调度和搬运。声明按
+PP stage 内的模型层号筛选传输层，读写时将层号映射到实际的紧凑设备
+buffer。host 仍只保存本 CP rank 持有的活动层，packed draft 使用宿主
+分配的尾部位置。没有 Index-K 的 shard 跳过内存注册和搬运。FP8/INT8
+沿用现有 packed 字节，BF16 使用同一存储的字节视图。
+
+PD Decode 已有普通 Radix 前缀匹配、加锁、页对齐和后缀传输。结合 HiCache
+命中时，命中部分的 Index-K 由缓存保留或从 host 恢复。
+本轮只执行本地 lint、语法和结构检查，L2 搬运与 Decode 命中待实机核对。
+
+## 2026-11-20 GLM-5.3 PD Decode Radix 与 MTP
+
+参考 [框架 #39](https://github.com/maxiaobetter/sglang-das/pull/39)，GLM-5.3
+在 `DCP1`、EAGLE/NextN `topk=1`、真实 PD 传输及关闭 HiSparse 时允许
+Decode Radix。启动时只替换 v0.5.22 的对应 speculative guard，其他校验由
+宿主管理。已命中的 Main KV 和 Index-K 继续按现有的前缀保留和后缀传输逻辑处理。
+
+预分配记录已提交的 prompt 长度。首个 Decode 结果同步后，由宿主按对齐的
+prompt key 入树，同时迁移前缀锁并回收重复页。请求结束仅释放自己仍持有的页。
+同前缀并发请求沿用在飞 prompt 的等待判定。设备调用对齐、Graph 换输入重放和
+端到端精度待验证。
+
+GLM-5.3 的 PD Decode 在 overlap 模式下可能先提交下一轮 forward，再处理上一轮结果。
+仅当待处理批次有待入树的 prompt 且下一轮已经提交时，等待 forward stream 完成，
+再迁移前缀锁、重绑页表和释放重复页。这样 Mooncake 可接收后续请求的 KV，
+且它获得的页不会再被前一轮 forward 读取。
+
+GLM-5.3 的 PP1 Prefill CP LayerSplit 单层 MTP 配方中，draft Main-KV 的 L2 备份和
+回载只在该层 owner 上执行。设备索引仍是 target 模型层数之后的 packed draft 索引，
+host 索引使用本 rank 的 target host 层数之后的槽位。Index-K 沿用已有的 owner 过滤。
+本轮只做本地 lint、语法和结构检查，DCU 上的搬运、重叠调度及端到端精度待验证。
+
+发布分支冒烟发现 v0.5.22 同时传入 AFTER hook 的位置返回值和宿主 `result=` 参数。
+Decode hook 将处理后的输出作为仅限位置参数接收，避免与宿主关键字冲突。
+
+本次发布镜像的 DeepGEMM pair32 要求 masked FP8 GEMM 的 A scale 连续，且每 token 一个 scale。
+回移主线 #46 的 DeepEP legacy FP8 low-latency per-token 参数和 gate/up、down 两处连续化。
+## 2026-11-20 gfx938 Qwen attention 门控与 FP8 量化融合
+
+已有隔离环境记录覆盖 CP8 的 12K/MTP 调用对照和普通 eager decode。
+本分支只做本地结构与 lint 检查。DCP4、HiSparse 和完整 Graph 组合需要按
+实际部署配方另行复验；历史候选结果按原环境记录。
+
+## 2026-11-18 GLM-5.3 FP8 absorb BMM 分发对齐
+
+复用原生镜像 `sglang 0.5.18+glm.cc4dceb` 中的 `glm_absorb_bmm.py`，
+源码 SHA-256 为 `c51c3854924bc5502c1ec33159a1ae6f2cac8c85e1189db0dcc81af3d53b17e0`。
+GLM-5.3 MLA 的 prepare 和 core 将当前批次传给 Q/V BMM 分发。
+分发用 `effective_forward_mode` 识别 MLP-sync 前的阶段，在原生阶段和
+布局条件满足时优先尝试 Triton，再使用既有的 skinny 和 `torch.bmm` 回退。
+确定性推理、batch-invariant 和编译门控沿用原生条件。
+
+在两节点 EP8 上用 Handoff R 的 A/B 张量对拍。Draft extend 和 target verify
+的 Q/V 各 16 份与原生 Triton 输出逐位一致。普通 decode 的 32 份 Q/V
+保留 skinny 路径并逐位一致。8 个 rank 的算子级 HIP Graph 同址换入另一组
+输入后，64 份 draft extend 和 target verify 的 Q/V 输出也与原生参考逐位一致。
+证据见 Handoff R 的 `device-replay/absorb-bmm-q-replay/bmm-summary.json`。
+
+## 2026-11-19 DeepEP 清理接口兼容
+
+插件在加载时检查安装包的清理函数签名。镜像 DeepEP `g4afb59` 的清理
+实现内部使用 K=8，插件沿用原生 SGLang 的三参调用。接受 `num_topk`
+关键字的接口接收实际 `state.num_topk`。Normal → low-latency 在清理
+成功后切换分发模式。
+
+两节点使用真实 GLM-5.3 Channel FP8 请求的实参完成 EP8 同输入复验。
+八 rank 的 384 条 low-latency 路由、FP8 payload、FP32 scale 和 BF16
+combine 输出逐位一致，前后通信和清理 kernel 的符号、次数与首发尺寸
+一致。真实 eager IFB 两侧均为 8/8，完整输出 token、结束原因和 MTP
+接受统计逐请求相同，两侧八个 rank 都命中 low-latency decode。
+证据见 `device-replay/short-ab-20261119/RUN.md`。
+
+归档的 fake 性能使用固定 low-latency 和 full Graph。启用 DeepEP auto 时，
+Graph replay 恢复捕获的分发模式，若此前是 normal，会先清理 buffer。
+该切换场景的同址换输入回放尚未验证。
+
+## 2026-11-19 GLM-5.3 FP8 稳态 prefill 优化
+
+`SGLANG_GLM_OPT_PREFILL=1` 在既有模型和输入门控下启用 GLM-5.3 Channel
+FP8 的 packed KV、physical KV compact、Add RMS align16、K1 indirect
+和 EP K8 gather。两项 prefill 开关默认关闭。packed KV 的 CP all-gather 使用每行 656 字节的
+uint8 布局，逻辑长度等于物理长度时直接使用有效行。K8 和 Add RMS
+优先使用已有的显式扩展路径，随后尝试镜像中带对应参数的 LightOp 接口。
+K1 从 plugin 自带的 WASP 头文件和绑定编译。设置
+`SGLANG_HCU_GLM53_FP8_K1_AUTO_BUILD=1` 后，符合条件的 GLM-5.3
+Channel FP8 prefill worker 在启动时编译或加载节点缓存。各 rank
+通过文件锁和原子发布共享产物。K1 仍按模型结构、量化方式和张量布局选择，
+加载扩展时检查 ABI 和导出入口。配置见 [K1 indirect-A](configuration.md#8-glm-53-fp8-prefill-的-k1-indirect-a-候选)。
+本地用替代编译进程核对八进程并发只生成一份产物、热启动复用、
+Python 或 DTK 变化后重新构建，以及编译失败后可重试。DCU 上的实际
+编译、服务启动和 K1 命中待验证。
+HCU dcp=1 在 FlashMLA KV 分发前使用匹配 page table 的有效 top-k 行，
+保留隔离试验带入的 padding 行裁剪逻辑。
+
+`SGLANG_GLM_PREFILL_SHARED_OVERLAP=1` 单独启用受支持的 eager、normal
+DeepEP 路径。共享专家旁流在 `dispatch_a` 提交 routed FP8 量化后记录
+并等待事件，与 `dispatch_b` 中的通信并行。routed 结果与共享结果相加前
+等待共享旁流完成。每次 forward 退出时清理 dispatcher hook。
+
+设备性能证据来自两节点 BW1300、TP8/CP8/EP8、并发 8 的隔离试验。
+匹配输入和缓存后，8 rank 的稳态 1/5/2 对齐，等待量化完成使 bs=5
+routed FP8 从 380.0 降到 76.6 微秒，数据 dispatch 与共享 GEMM 的
+重叠从 2.7 增到 66.5 毫秒。关闭 profiler 的 ABBA 中，稳态整波中位数
+从 4.643 降到 4.605 秒。此前的同输入原生对照为 4.306 秒，整体仍
+慢约 7.0%。证据见隔离试验 `quant-event-ab-20261119-1643/RUN.md`。
+本次正式实现的检查范围为 CI lint、源码语法与文档导览。设备结果属于
+隔离试验，正式提交的 GPU 复采、真实请求端到端精度和 graph replay
+仍待验证。
+
+## 2026-11-20 minimax-M3.1（m31）整线过闸进 main
+
+分叉背景：m31 底座文件 main 从未有过，release/proj→main 增量挑选组
+（#60/#70/#71/#82/#83/#84/#85）整线落不位；owner 拍板过闸——一次性把
+m31 整线（底座+增量最终态）搬入 main，之后日常增量恢复。
+
+提交范围（chore/gate-minimax-m31，段间可独立 revert）：
+①底座：proj/minimax-m3.1 的 m31 族新文件整线落位（首版 39 文件
++8866 行；models/attention/moe/kernels/jit csrc/quantization/tests）；
+不携带 proj 线漂移（h3 multimodal 删改、__init__/environ/server_args
+旧快照、0.5.23 bump、CI 删除）。
+②接线：pyproject 独立 entry point `hcu_minimax_m31`；
+deepep_fp8.around_ep_init 与 slimquant 权重后处理各加
+HCU_PLUGIN_MINIMAX_M31_DEEPEP opt-in gate（union 只加不改）。
+③契约：expected_hook_targets 并入 m31 条目（去重回排）。
+④快照刷新（review 拍板「以 proj tip 为准」）：proj 线推进 6 笔
+（#99 合并 + EPLB live 权重/per-step 记录 + shared-expert overlap
+prefill/decode + HiSparse PD decode 对齐 + SwiGLU/INT8 CP-prefill
+融合）后整族重对齐 ba402d9——14 改 + 5 新（eplb/minimax_m31、
+moe/minimax_m31_prefill_overlap、models/_minimax_rocm_pinned_kv、
+tests eplb/hisparse_mapping）；共享接线 deepep_current 增
+register_deepep_normal_combine_hook（EPLB 用，proj hunk 原样）。
+⑤bot review P3：swiglu_m31_int8 的 lightop 探测改降级不抛
+（find_spec 对 dotted name 会 import 父包；env 关短路语义不变）。
+契约并入 proj tip 新增 7 条 m31 族 target（m3_vl 随多模态范围排除）。
+
+kernel 半边说明：#85 的 pack_unit_scale_fp8_kv 实体已在 adapter-das
+#146（adapter main），plugin 侧只带调用接线，无重复实体。
+adapter 依赖核对：仅该符号（adapter main 已有）；sgl_kernel 头文件来自
+上游 sglang jit include，与既有 overlay 同惯例。
+
+## 2026-11-20 PR81 review runtime follow-up
 
 八卡 2P1D 模型 smoke 已通过 8 项 math/vision/sequence 与 4 项约 9k token
 新前缀检查。P 为 TP2/attention-DP2/EP2，D 为 TP4/attention-DP4/EP4，
