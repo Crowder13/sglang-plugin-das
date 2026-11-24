@@ -4528,3 +4528,13 @@ HCU 通过原有 flash-attn 的变长入口执行 sBSA 的内部稠密回退。
 派发检查。gfx938 的 37,736 token、14 heads 测试中，FA2 中位耗时
 45.43 ms，sBSA 含路由、排序和执行为 22.48 ms。固定稀疏计划的四个边界
 Q 行通过 FP32 参考比对。
+
+将插件 [#116](https://github.com/HYGON-AI/sglang-plugin-das/pull/116) 的整页容量和长请求准入覆盖到 GLM-5.3 Channel FP8 的 HiSparse PD Decode。Index-K 与逻辑分配器使用同一个整页容量，MTP draft 继续从 target 分配器取逻辑地址空间。单服务 Prefill 的准入口径仍由设备池决定。Mooncake 的 host KV 注册沿用发布基线的 CPU 张量地址。
+
+本地探针使用 Channel FP8、W4A8 两组权重配置，覆盖倍率 1.5 下的整页取整、worker 上报容量与模型上下文上限，并核对 IFB 和关闭 HiSparse 时的现有分发。真实双节点 Mooncake、长请求和 EAGLE 换输入重放仍待实机验证。
+
+
+
+在 IFB 池初始化复用 Index-K 和逻辑分配器的完整页取整，使小数倍率可以传给两类池的构造流程。IFB worker 仍使用设备池计算请求上限，因为整个 Prefill 的 KV 在搬到 host 前需要设备页。
+
+CPU 探针核对倍率 1.5、整数倍率回退和 IFB worker 的设备容量。硬件验收单独记录。
