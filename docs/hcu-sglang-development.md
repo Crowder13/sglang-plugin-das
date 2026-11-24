@@ -4489,3 +4489,42 @@ Plugin 定向 66 项、HY3 RoPE 2 项、INT8 postload 1 项通过，无跳过；
 ## 2026-11-23 PR 拆分检查
 
 LightOP MQA planner 修复独立分支重新通过4项接线测试（CPU张量、设备可见）和3项gfx938 GPU/变输入Graph回归。隐藏设备时接线测试收集遇到上游 cutlass_fp8_supported 的 NoneType 比较错误，原失败保留，不记作通过。完整CPU unittest复测195项，仍为3项导入错误、13项跳过。L0与导览快照检查通过；未执行浏览器视觉验收。adapter节点门禁与triage失败另列于两仓PR说明，未以模型精度结果覆盖这些失败。仅准备Draft评审，未重复提交已有RoPE/TopK实现。
+
+## MiniMax-H3 参考视频预处理
+
+将 DAS 提交 `62713c5` 的输入处理移至 diffusion 插件。HCU 先传输 uint8 帧，
+直接生成连续的 FP32 视频。VAE 仅对运行时持有的输入复用默认归一化的存储，
+重新配置自定义 transform 后回到调用方提供的实现。
+
+初次移植在 1507 镜像原插件基线、gfx938 上验证。124×768×1344 RGB 帧
+经过真实 processor 的峰值分配从 4394.25 降至 1830.94 MiB。两组各运行
+五次，归一化输出及真实 Ref2VA 权重对 17 帧小片段编码所得 FP16 latent
+均逐字节相同。该数据覆盖参考输入和编码阶段。
+
+## MiniMax-H3 去噪结束时释放 USP 显存
+
+0.5.22 已按角色、dtype 和设备复用 Ulysses all-to-all 的容量。DAS 提交
+`62713c5` 还在去噪退出时交还当前设备的缓存。插件将这一部分接到 H3
+完整去噪循环的退出路径，使后续 VAE 和请求可用这部分内存。
+在 gfx938 注入请求异常后，原始异常和已返回视图均保留。一个 256 MiB
+的实际 staging 分配在原镜像继续驻留，插件在最后一个视图释放时回收全部
+256 MiB。该检查覆盖缓存生命周期，未复现旧版 50 请求压力场景。
+
+## MiniMax-H3 HCU SubBlock 稀疏注意力
+
+从 DAS 的 `52f1e99` 迁移到 diffusion 插件。使用 `SGLANG_PLUGINS=hcu` 入口，
+设置 `--attention-backend subblock_sparse_attn` 和
+`--component-attention-backends text_encoder=torch_sdpa,transformer=subblock_sparse_attn`。
+需安装与目标 Torch、DTK 和 Python 匹配的 `dcu_bsa` wheel。本轮构建使用
+DTK 26.10、Torch 2.13、Python 3.12，并包含 gfx936 和 gfx938。
+稀疏内核使用 BF16、head_dim 128，前 10 步按原生 schedule 执行稠密注意力。
+
+插件在 HCU 上连接原生 SubBlock router 与 DCU 内核。逐行有效块数与局部尾块
+传给内核，仅排序有效前缀。内部稠密实现单独记录后端选择，外层 transformer
+仍校验显式配置是否生效。在 release 使用的 FA2 只继承基础 packed-varlen 方法时，
+HCU 通过原有 flash-attn 的变长入口执行 sBSA 的内部稠密回退。
+
+1507 镜像的初次移植在两个架构各通过 26 项原生数值测试，均通过 SGLang 后端解析和第 9/10 步
+派发检查。gfx938 的 37,736 token、14 heads 测试中，FA2 中位耗时
+45.43 ms，sBSA 含路由、排序和执行为 22.48 ms。固定稀疏计划的四个边界
+Q 行通过 FP32 参考比对。
